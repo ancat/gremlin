@@ -19,3 +19,8 @@ Python proof of concept for loading shared objects. Very specific to x86_64 but
 shared object that prints cat emojis into a running htop process.
 
 ![inject_so](https://i.imgur.com/79XCq6q.png)
+
+# TODO
+
+1. Clean up redundant code (there's a lot)
+2. Break out architecture specific code
