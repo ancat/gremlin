@@ -25,3 +25,9 @@ shared object that prints cat emojis into a running htop process.
 `gcc -Wl,--no-as-needed -L/usr/lib/x86_64-linux-gnu/  -l:/usr/lib/x86_64-linux-gnu/libpython2.7.so -lpython2.7 -I/usr/include/python2.7 -pthread -shared -fPIC -o pyject.so pyject.c`
 
 `gcc -pthread -shared -fPIC -o fancy3.so fancy.c`
+
+# TODO
+
+1. Clean up redundant code (there's a lot)
+2. Break out architecture specific code
+>>>>>>> 2c3c016299c734079f2347a1a3cf2febb071e733
