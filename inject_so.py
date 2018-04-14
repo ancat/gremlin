@@ -61,6 +61,16 @@ PTRACE_DETACH     = 17
 pid = int(sys.argv[1])
 shared_object = sys.argv[2]
 
+def handle_signal(stat, expected, s):
+    if os.WSTOPSIG(stat) == expected:
+        ""
+    elif os.WSTOPSIG(stat) == 11:
+        print "child died (oops): {}".format(s)
+        sys.exit(1)
+    else:
+        print "stopped for some other signal ({}): {}".format(os.WSTOPSIG(stat), s)
+        sys.exit(1)
+
 def load_maps(pid):
     handle = open('/proc/{}/maps'.format(pid), 'r')
     output = []
@@ -103,7 +113,6 @@ def find_base(libdl, so_path):
 
         return 0
 
-
     target_callback = lambda x: callback(x, state, so_path)
 
     prototype = ctypes.CFUNCTYPE(ctypes.c_int64, ctypes.POINTER(dl_phdr_info))
@@ -142,12 +151,9 @@ libc.ptrace.restype = ctypes.c_uint64
 libc.ptrace(PTRACE_ATTACH, pid, None, None)
 
 stat = os.waitpid(pid, 0)
+
 if os.WIFSTOPPED(stat[1]):
-    if os.WSTOPSIG(stat[1]) == 19:
-        print "we attached!"
-    else:
-        print "stopped for some other signal??", os.WSTOPSIG(stat[1])
-        sys.exit(1)
+    handle_signal(stat[1], 19, "ptrace attach")
 
 backup_registers = user_regs_struct()
 registers        = user_regs_struct()
@@ -170,11 +176,7 @@ libc.ptrace(PTRACE_SINGLESTEP, pid, None, None)
 
 stat = os.waitpid(pid, 0)
 if os.WIFSTOPPED(stat[1]):
-    if os.WSTOPSIG(stat[1]) == 5:
-        ""
-    else:
-        print "stopped for some other signal??", os.WSTOPSIG(stat[1])
-        sys.exit(1)
+    handle_signal(stat[1], 5, "mmap rwx")
 
 libc.ptrace(PTRACE_GETREGS, pid, None, ctypes.byref(registers))
 rwx_page = registers.rax
@@ -214,11 +216,10 @@ libc.ptrace(PTRACE_POKEDATA, pid, ctypes.c_void_p(registers.rip), 0xccd0ff)
 libc.ptrace(PTRACE_CONT, pid, None, None)
 
 stat = os.waitpid(pid, 0)
-if os.WSTOPSIG(stat[1]) == 5:
-    ""
-else:
-    print "stopped for some other signal??", os.WSTOPSIG(stat[1])
-    sys.exit(1)
+registers        = user_regs_struct()
+libc.ptrace(PTRACE_GETREGS, pid, None, ctypes.byref(registers))
+print "__libc_dlopen_mode returned", hex(registers.rax)
+handle_signal(stat[1], 5, "__libc_dlopen_mode")
 
 libc.ptrace(PTRACE_POKEDATA, pid, ctypes.c_void_p(backup_registers.rip), backup_code)
 libc.ptrace(PTRACE_SETREGS, pid, None, ctypes.byref(backup_registers))
