@@ -2,6 +2,12 @@ import ctypes
 import sys
 import os
 
+# These could vary in your system
+libc_path = "/usr/lib64/libc.so.6"
+libdl_path = "/usr/lib64/libdl.so.2"
+# For the inject use our own stack, and specify the size in bytes
+stacksize = 200*1024
+
 class user_regs_struct(ctypes.Structure):
     _fields_ = [
         ("r15", ctypes.c_ulonglong),
@@ -65,10 +71,10 @@ def handle_signal(stat, expected, s):
     if os.WSTOPSIG(stat) == expected:
         ""
     elif os.WSTOPSIG(stat) == 11:
-        print "child died (oops): {}".format(s)
+        print ("child died (oops): {}".format(s))
         sys.exit(1)
     else:
-        print "stopped for some other signal ({}): {}".format(os.WSTOPSIG(stat), s)
+        print ("stopped for some other signal ({}): {}".format(os.WSTOPSIG(stat), s))
         sys.exit(1)
 
 def load_maps(pid):
@@ -105,12 +111,16 @@ def find_base(libdl, so_path):
     def callback(e, state, target):
         dlpi_addr = e.contents.dlpi_addr
         dlpi_name = e.contents.dlpi_name
-
+        print ("name addr ",dlpi_name,dlpi_addr)
         if dlpi_addr:
             if dlpi_name == target:
                 state.value = dlpi_addr
                 return 1
-
+            # In my system, lib64 is a soft link to /usr/lib64, and the name could be either...
+            # So scan using just the library name to make sure...
+            if dlpi_name.decode('utf-8').split("/")[-1] == target.split("/")[-1]:
+                state.value = dlpi_addr
+                return 1
         return 0
 
     target_callback = lambda x: callback(x, state, so_path)
@@ -121,32 +131,42 @@ def find_base(libdl, so_path):
     return state.value
 
 maps = load_maps(pid)
-process_libc = filter(
-    lambda x: '/libc-' in x['map_name'] and 'r-xp' == x['permissions'],
+process_libc = list(filter(
+    lambda x: '/libc.' in x['map_name'] and 'r-xp' == x['permissions'],
     maps
-)
+))
 
 if not process_libc:
-    print "Couldn't locate libc shared object in this process."
+    print ("Couldn't locate libc shared object in this process.")
     sys.exit(1)
 
 libc_base     = process_libc[0]['addr_start']
 libc_location = process_libc[0]['map_name']
+libc_offset   = process_libc[0]['offset']
+print ("libc in target is ", hex(libc_base),libc_location,hex(libc_offset))
 
-libdl = ctypes.CDLL('/lib/x86_64-linux-gnu/libdl.so.2')
-libdl.dlopen.restype = ctypes.c_void_p
-libdl.dlsym.restype = ctypes.c_void_p
+libc = ctypes.CDLL(libc_path)
+libdl = ctypes.CDLL(libdl_path)
+libc.dlopen.restype = ctypes.c_void_p
+libc.dlsym.restype = ctypes.c_void_p
 
-libc_handle = libdl.dlopen(libc_location, 0)
+libc_handle = libc.dlopen(libc_location, 0)
 
-dlopen_mode = ctypes.create_string_buffer("__libc_dlopen_mode\x00")
-dlopen_mode = libdl.dlsym(ctypes.c_void_p(libc_handle), ctypes.byref(dlopen_mode))
-dlopen_mode_offset = dlopen_mode - find_base(libdl, "/lib/x86_64-linux-gnu/libc.so.6")
-__libc_dlopen_mode = dlopen_mode_offset + libc_base
+# Try __libc_dlopen_mode first, but this seems to be private in libc6
+dlopen_call = ctypes.create_string_buffer(bytes("__libc_dlopen_mode","ascii")+b"\x00")
+dlopen_call = libc.dlsym(ctypes.c_void_p(libc_handle), ctypes.byref(dlopen_call))
+if not dlopen_call:
+  # Try simply dlopen
+  dlopen_call = ctypes.create_string_buffer(bytes("dlopen","ascii")+b"\x00")
+  dlopen_call = libc.dlsym(ctypes.c_void_p(libc_handle), ctypes.byref(dlopen_call))
+dlopen_call_offset = dlopen_call - find_base(libdl, libc_path)
+print ("dlopen preferred call is offset @", hex(dlopen_call_offset))
+dlopen_call = dlopen_call_offset + libc_base - libc_offset
+print ("dlopen call in target is @", hex(dlopen_call))
 
-libc = ctypes.CDLL('/lib/x86_64-linux-gnu/libc.so.6') # Your libc location may vary!
 libc.ptrace.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_void_p]
 libc.ptrace.restype = ctypes.c_uint64
+
 
 libc.ptrace(PTRACE_ATTACH, pid, None, None)
 
@@ -155,39 +175,56 @@ stat = os.waitpid(pid, 0)
 if os.WIFSTOPPED(stat[1]):
     handle_signal(stat[1], 19, "ptrace attach")
 
-backup_registers = user_regs_struct()
-registers        = user_regs_struct()
+print ("Attached to target")
 
-libc.ptrace(PTRACE_GETREGS, pid, None, ctypes.byref(backup_registers))
-libc.ptrace(PTRACE_GETREGS, pid, None, ctypes.byref(registers))
-backup_code = libc.ptrace(PTRACE_PEEKDATA, pid, ctypes.c_void_p(registers.rip), None)
+pagesize = os.sysconf("SC_PAGE_SIZE")
+print ("page size is",pagesize)
 
-registers.rax = 9        # sys_mmap
-registers.rdi = 0        # offset
-registers.rsi = 10       # size
-registers.rdx = 7        # map permissions
-registers.r10 = 0x22     # anonymous
-registers.r8 = 0         # fd
-registers.r9 = 0         # fd
+pagesize  = os.sysconf("SC_PAGE_SIZE")
+# Stacklen does not include an additional page used for the injection code and any parameters
+# make it a multiple of pagesize
+maplen = (int(((stacksize)+(pagesize-1))/pagesize) ) * pagesize + pagesize
+print ("Setting mapsize to",hex(maplen),"bytes with pagesize",pagesize)
 
-libc.ptrace(PTRACE_SETREGS, pid, None, ctypes.byref(registers))
-libc.ptrace(PTRACE_POKEDATA, pid, ctypes.c_void_p(registers.rip), 0x050f)
-libc.ptrace(PTRACE_SINGLESTEP, pid, None, None)
+def ptrace_call_syscall(libc,syscall,arg1=0,arg2=0,arg3=0,arg4=0,arg5=0,arg6=0):
+    backup_registers = user_regs_struct()
+    registers        = user_regs_struct()
 
-stat = os.waitpid(pid, 0)
-if os.WIFSTOPPED(stat[1]):
-    handle_signal(stat[1], 5, "mmap rwx")
+    libc.ptrace(PTRACE_GETREGS, pid, None, ctypes.byref(backup_registers))
+    libc.ptrace(PTRACE_GETREGS, pid, None, ctypes.byref(registers))
+    backup_code = libc.ptrace(PTRACE_PEEKDATA, pid, ctypes.c_void_p(registers.rip), None)
+    print ("Saved registers and injection point data")
 
-libc.ptrace(PTRACE_GETREGS, pid, None, ctypes.byref(registers))
-rwx_page = registers.rax
-print "rwx page @", hex(rwx_page)
+    registers.rax = syscall
+    registers.rdi = arg1
+    registers.rsi = arg2
+    registers.rdx = arg3
+    registers.r10 = arg4
+    registers.r8 =  arg5
+    registers.r9 =  arg6
 
-libc.ptrace(PTRACE_POKEDATA, pid, ctypes.c_void_p(backup_registers.rip), backup_code)
-libc.ptrace(PTRACE_SETREGS, pid, None, ctypes.byref(backup_registers))
+    libc.ptrace(PTRACE_SETREGS, pid, None, ctypes.byref(registers))
+    libc.ptrace(PTRACE_POKEDATA, pid, ctypes.c_void_p(registers.rip), 0x050f)
+    libc.ptrace(PTRACE_SINGLESTEP, pid, None, None)
+
+    stat = os.waitpid(pid, 0)
+    if os.WIFSTOPPED(stat[1]):
+        handle_signal(stat[1], 5, "syscall")
+
+    libc.ptrace(PTRACE_GETREGS, pid, None, ctypes.byref(registers))
+
+    libc.ptrace(PTRACE_POKEDATA, pid, ctypes.c_void_p(backup_registers.rip), backup_code)
+    libc.ptrace(PTRACE_SETREGS, pid, None, ctypes.byref(backup_registers))
+    print ("restored process state after syscall")
+    return registers.rax
+
+# sys_mmap, offset=0, size=maplen, permissions=7,0x22 is anonymous
+rwx_page = ptrace_call_syscall(libc,9,0,maplen,7,0x22)
+print ("mmap complete, rwx page @", hex(rwx_page),"to",hex(rwx_page+maplen))
 
 def write_process_memory(pid, address, size, data):
-    bytes_buffer = ctypes.create_string_buffer('\x00'*size)
-    bytes_buffer.raw = data
+    bytes_buffer = ctypes.create_string_buffer(size)
+    bytes_buffer.raw = bytes(data,"ascii")
     local_iovec  = iovec(ctypes.cast(ctypes.byref(bytes_buffer), ctypes.c_void_p), size)
     remote_iovec = iovec(ctypes.c_void_p(address), size)
     bytes_transferred = libc.process_vm_writev(
@@ -197,32 +234,72 @@ def write_process_memory(pid, address, size, data):
     return bytes_transferred
 
 path = shared_object
-write_process_memory(pid, rwx_page + 100, len(path)+1, path)
+write_process_memory(pid, rwx_page + 0xff, len(path)+1, path)
 
-backup_registers = user_regs_struct()
-registers        = user_regs_struct()
+# Stack starts at the last 16 byte aligned area of rwx_page
+stack = (rwx_page + maplen - 1)&(0xfffffffffff0)
+print ("setting stack to",hex(stack))
 
-libc.ptrace(PTRACE_GETREGS, pid, None, ctypes.byref(backup_registers))
-libc.ptrace(PTRACE_GETREGS, pid, None, ctypes.byref(registers))
+def ptrace_call_library(libc,libaddr,stack,injectaddr,arg1=0,arg2=0,arg3=0,arg4=0,arg5=0,arg6=0):
 
-registers.rdi = rwx_page + 100 # path to .so file
-registers.rsi = 1              # RTLD_LAZY
-registers.rax = __libc_dlopen_mode
+  backup_registers = user_regs_struct()
+  registers        = user_regs_struct()
 
-backup_code = libc.ptrace(PTRACE_PEEKDATA, pid, ctypes.c_void_p(registers.rip), None)
+  libc.ptrace(PTRACE_GETREGS, pid, None, ctypes.byref(backup_registers))
+  libc.ptrace(PTRACE_GETREGS, pid, None, ctypes.byref(registers))
 
-libc.ptrace(PTRACE_SETREGS, pid, None, ctypes.byref(registers))
-libc.ptrace(PTRACE_POKEDATA, pid, ctypes.c_void_p(registers.rip), 0xccd0ff)
+  registers.rsp = stack           # our private stack
+  registers.rax = libaddr         # function to call
+  registers.rdi = arg1            # arg1
+  registers.rsi = arg2            # arg2
+  registers.rdx = arg3            # arg3
+  registers.rcx = arg4            # arg4
+  registers.r8 = arg5             # arg5
+  registers.r9 = arg6             # arg6
+  registers.rip = injectaddr      # where our injected subroutine call is
+
+  libc.ptrace(PTRACE_SETREGS, pid, None, ctypes.byref(registers))
+  libc.ptrace(PTRACE_POKEDATA, pid, ctypes.c_void_p(rwx_page), 0xccd0ff)
+  libc.ptrace(PTRACE_CONT, pid, None, None)
+
+  stat = os.waitpid(pid, 0)
+  registers        = user_regs_struct()
+  libc.ptrace(PTRACE_GETREGS, pid, None, ctypes.byref(registers))
+  print ("library call returned", hex(registers.rax))
+  handle_signal(stat[1], 5, "library call")
+  libc.ptrace(PTRACE_SETREGS, pid, None, ctypes.byref(backup_registers))
+  return registers.rax
+
+rtn = ptrace_call_library(libc,dlopen_call,stack,rwx_page,rwx_page+0xff,1)
+
+def ptrace_getstr(libc,addr,maxlen=256):
+    # read null terminated string from the target. For safety, use a maxlen
+    i=0
+    retstr = ""
+    while (i<maxlen):
+      word = libc.ptrace(PTRACE_PEEKDATA, pid, ctypes.c_void_p(rtn+i), None)
+      word = word.to_bytes(8,"little")
+      for x in word:
+          if (x==0):
+              i=maxlen
+          else:
+              if i<maxlen:
+                retstr+=chr(x)
+      i=i+8
+    return retstr
+
+if (rtn == 0):
+  # call dlerror, and if it returns a pointer treat it as a (char *) null terminated
+  dlerror_call = ctypes.create_string_buffer(bytes("dlerror","ascii")+b"\x00")
+  dlerror_call = libc.dlsym(ctypes.c_void_p(libc_handle), ctypes.byref(dlerror_call))
+  dlerror_call_offset = dlerror_call - find_base(libdl, libc_path)
+  dlerror_call = dlerror_call_offset + libc_base - libc_offset
+  rtn = ptrace_call_library(libc,dlerror_call,stack,rwx_page)
+  if (rtn):
+    retstr = ptrace_getstr(libc,rtn)
+    print ("error is",retstr)
+
 libc.ptrace(PTRACE_CONT, pid, None, None)
-
-stat = os.waitpid(pid, 0)
-registers        = user_regs_struct()
-libc.ptrace(PTRACE_GETREGS, pid, None, ctypes.byref(registers))
-print "__libc_dlopen_mode returned", hex(registers.rax)
-handle_signal(stat[1], 5, "__libc_dlopen_mode")
-
-libc.ptrace(PTRACE_POKEDATA, pid, ctypes.c_void_p(backup_registers.rip), backup_code)
-libc.ptrace(PTRACE_SETREGS, pid, None, ctypes.byref(backup_registers))
-libc.ptrace(PTRACE_CONT, pid, None, None)
+print ("target process resuming")
 
 
